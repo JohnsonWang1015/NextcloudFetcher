@@ -1,0 +1,19 @@
+[project]
+name = "nextcloudfetch"
+version = "0.1.0"
+description = "Nextcloud file or folder fetcher/downloader"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "nextcloud-api-wrapper",
+    "python-dotenv",
+    "tqdm",
+    "typer",
+]
+
+[project.scripts]
+ncfetch = "ncfetch.cli:app"
+
+[tool.typer]
+colored = true
