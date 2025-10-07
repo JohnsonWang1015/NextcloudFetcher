@@ -17,3 +17,7 @@ ncfetch = "ncfetch.cli:app"
 
 [tool.typer]
 colored = true
+
+[tool.uv]
+package = true
+packages = [{ include = "ncfetch", from = "src" }]
