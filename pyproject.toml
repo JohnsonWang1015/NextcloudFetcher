@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
 [project]
 name = "nextcloudfetch"
 version = "0.1.0"
@@ -15,9 +19,8 @@ dependencies = [
 [project.scripts]
 ncfetch = "ncfetch.cli:app"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/ncfetch"]
+
 [tool.typer]
 colored = true
-
-[tool.uv]
-package = true
-packages = [{ include = "ncfetch", from = "src" }]
