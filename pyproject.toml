@@ -24,3 +24,12 @@ packages = ["src/ncfetch"]
 
 [tool.typer]
 colored = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
