@@ -1,9 +1,10 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# 從執行時的 CWD 往上搜尋 .env；安裝為套件後仍能從使用者專案目錄載入。
+load_dotenv(find_dotenv(usecwd=True))
 
 @dataclass(frozen=True)
 class Settings:
