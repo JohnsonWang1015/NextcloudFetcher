@@ -15,16 +15,16 @@
 
 ```bash
 # uv
-uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
+uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
 
 # 加進另一個 uv 專案的相依
-uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
+uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
 
 # 純 pip
-pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
+pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
 
 # 隔離安裝為全域 CLI（類似 pipx）
-uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
+uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
 ```
 
 > Private repo 的話請改用 SSH (`git+ssh://git@github.com/...`) 或在 URL 帶入 PAT。
@@ -78,9 +78,10 @@ REQUEST_TIMEOUT=60
 ncfetch file "Projects/report.pdf" -o ./downloads
 ```
 
-下載整個資料夾（Nextcloud 會回 ZIP，可選自動解壓）：
+下載整個資料夾（優先讓伺服器回 ZIP；伺服器不支援時自動 fallback 成 PROPFIND 遞迴下載 + 本機打包，可調並行數）：
 ```bash
 ncfetch folder "Datasets/2025" --zip ./downloads/2025.zip --unzip-to ./downloads/2025
+ncfetch folder "Datasets/2025" --zip ./downloads/2025.zip -w 16   # fallback 時的並行下載數
 ```
 
 無密碼公開分享 — 下載單一檔案（token 或完整 URL 都可）：
@@ -162,7 +163,7 @@ ncfetch upload-folder ./dataset "Datasets/raw" --no-overwrite
 ### 升級
 
 ```bash
-uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
+uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
 ```
 
-或把上面 `@v0.2.0` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。
+或把上面 `@v0.2.1` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。

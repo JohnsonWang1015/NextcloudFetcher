@@ -26,7 +26,7 @@ uv run pytest tests/test_webdav_dav.py # one file
 uv run pytest -k humanize              # by name
 ```
 
-The current test suite covers **pure functions only** — XML parsing (`parse_propfind`), token extraction, ZIP-response sniffing, humanize formatting, password resolution, base-prefix stripping, and Zip Slip rejection in `unzip()`. HTTP-mocked integration tests for the three-tier fallback are not yet wired up — add `respx` to dev deps and mock `httpx` if you go there.
+The current test suite covers **pure functions only** — XML parsing (`parse_propfind`), token extraction, ZIP-response sniffing, humanize formatting, password resolution, base-prefix stripping, Zip Slip rejection in `unzip()`, and `_build_url` percent-encoding. HTTP-mocked integration tests for the tiered fallback flows (WebDAVProvider 2-tier, PublicShareProvider 3-tier) are not yet wired up — add `respx` to dev deps and mock `httpx` if you go there.
 
 ### Running the CLI subcommands
 
@@ -56,22 +56,38 @@ Public-share password resolution order (see `cli._public_pwd`): `--password` fla
 
 `provider_base.StorageProvider` is an ABC with four async methods: `download_file`, `download_folder_zip`, `list_folder`, `download_folder_tree`. Two concrete providers implement it:
 
-- **`providers/webdav_provider.WebDAVProvider`** — authenticated user. Files: `GET /remote.php/dav/files/<user>/<path>`. Folders: same URL with `Accept: application/zip` (Nextcloud responds with a server-built ZIP).
-- **`providers/public_share_provider.PublicShareProvider`** — public share. Auth is `(token, share_password_or_empty)` via HTTP Basic. Base WebDAV path is `<base_url>/public.php/webdav`.
+- **`providers/webdav_provider.WebDAVProvider`** — authenticated user. Files: `GET /remote.php/dav/files/<user>/<path>`. Folders use a **two-tier fallback** (see below): tier 1 tries `Accept: application/zip` on the user WebDAV URL, tier 2 falls back to recursive PROPFIND + client-side ZIP packing.
+- **`providers/public_share_provider.PublicShareProvider`** — public share. Auth is `(token, share_password_or_empty)` via HTTP Basic. Base WebDAV path is `<base_url>/public.php/webdav`. Folders use a **three-tier fallback** (see below).
 
-Shared WebDAV plumbing lives in **`webdav_dav.py`** (`propfind()`, `parse_propfind()`, `DAVEntry`) and the **`download_tree()`** free function in `webdav_provider.py` — both providers reuse the same walker by passing their own `_build_url` / `_build_webdav_url` as a callback. Keep WebDAV-protocol bits there, not in the providers themselves.
+Shared WebDAV plumbing lives in **`webdav_dav.py`** (`propfind()`, `parse_propfind()`, `DAVEntry`). Module-level free functions in `webdav_provider.py` are shared across both providers via `url_builder` callbacks:
+- `download_tree()` — recursive mirror to a local directory tree.
+- `build_folder_zip_via_propfind()` — recursive PROPFIND + parallel temp downloads + serial `ZipFile.write` (the "always works" tier for both providers).
+- `_is_zip_response()` — Content-Type / Content-Disposition sniffer used by every tier that expects a ZIP back.
+
+Keep WebDAV-protocol bits in `webdav_dav.py` / these free functions, not duplicated inside the providers.
 
 If you add a new transport (e.g., OCS Share API, S3-backed mirror), make it another `StorageProvider` and wire a new Typer command in `cli.py` — do **not** push transport-specific logic into the CLI module.
 
-### Public-share folder download: three-tier fallback (important)
+### Folder ZIP download: tiered fallback (important)
 
-`PublicShareProvider.download_folder_zip` tries three strategies in order, catching exceptions and falling through:
+Both providers `download_folder_zip` try a sequence of strategies in order, catching exceptions and falling through. Each tier validates the response is actually a ZIP via `_is_zip_response`; if Nextcloud returns an HTML page or WebDAV `multistatus` XML instead, the tier "fails" and the next is tried. Failures are logged at `WARNING` and the half-written ZIP is `unlink`'d before falling through, so a partial early-tier ZIP can't be mistaken for a successful late-tier output.
 
-1. **Web endpoint** — `GET /s/<token>/download?path=/<folder>` (closest to browser behavior). Validates that the response is actually a ZIP via `_is_zip_response`; if Nextcloud returns the WebDAV HTML page instead, this tier "fails" and the next is tried.
-2. **Public WebDAV ZIP** — `GET public.php/webdav/<folder>` with `Accept: application/zip`. Only some Nextcloud versions/configs support this; same ZIP-vs-HTML sniff.
-3. **Recursive PROPFIND + parallel client-side ZIP** — walks the share with `PROPFIND` (depth=1) per directory (sequential), enumerates every file, then downloads **N at a time** (`--workers`, default 8) into per-file `tempfile.NamedTemporaryFile`s. A single `asyncio.Lock` serializes `ZipFile.write(tmp_path, arcname=...)` since `zipfile.ZipFile` is **not thread-safe** — the lock is mandatory, do not remove it.
+**`WebDAVProvider` (authenticated user) — 2 tiers:**
 
-Each tier's failures are logged at `WARNING` and the half-written ZIP is `unlink`'d before falling through, so a partial tier-1 ZIP can't be mistaken for a successful tier-3 output. Preserve this chain when modifying — tiers 1 and 2 are fast/cheap but unreliable across versions; tier 3 is the always-works fallback. For password-protected shares, `_login_public_share` performs the `POST /s/<token>` cookie dance before tier 1 since the web endpoint requires session auth, not just Basic.
+1. **User WebDAV ZIP** — `GET /remote.php/dav/files/<user>/<folder>` with `Accept: application/zip`. Some Nextcloud builds honor this and serve a server-built ZIP; others return an HTML/XML directory listing and get sniffed-rejected.
+2. **Recursive PROPFIND + client-side ZIP** — falls through to `build_folder_zip_via_propfind()`.
+
+**`PublicShareProvider` (public share) — 3 tiers:**
+
+1. **Web endpoint** — `GET /s/<token>/download?path=/<folder>` (closest to browser behavior). For password-protected shares, `_login_public_share` performs the `POST /s/<token>` cookie dance first since this endpoint requires session auth, not just Basic.
+2. **Public WebDAV ZIP** — `GET public.php/webdav/<folder>` with `Accept: application/zip`. Only some Nextcloud versions/configs support it.
+3. **Recursive PROPFIND + client-side ZIP** — same `build_folder_zip_via_propfind()` helper as WebDAVProvider tier 2.
+
+**The shared tier — `build_folder_zip_via_propfind()`:**
+
+Walks the share with `PROPFIND` (depth=1) per directory (sequential), enumerates every file, then downloads **N at a time** (`--workers`, default 8) into per-file `tempfile.NamedTemporaryFile`s. A single `asyncio.Lock` serializes `ZipFile.write(tmp_path, arcname=...)` since `zipfile.ZipFile` is **not thread-safe** — the lock is mandatory, do not remove it. Both providers feed the same helper with their own `url_builder` (`_build_url` vs `_build_webdav_url`); auth differences are absorbed by the `httpx.AsyncClient` each provider opens.
+
+Preserve this chain when modifying — early tiers are fast/cheap but unreliable across Nextcloud versions; the recursive PROPFIND tier is the always-works fallback.
 
 ### Config
 
