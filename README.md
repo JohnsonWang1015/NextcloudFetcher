@@ -1,6 +1,6 @@
 ## Nextcloud Fetcher
 
-使用 Python，透過 Nextcloud **WebDAV** 與**公開分享 (public share)** 介面下載檔案或整個資料夾 (ZIP)，支援自動解壓縮與密碼分享。
+使用 Python，透過 Nextcloud **WebDAV** 與**公開分享 (public share)** 介面下載/上傳檔案或整個資料夾 (下載資料夾為 ZIP)，支援自動解壓縮與密碼分享。
 
 - Python 3.10+
 - 安裝後提供 `ncfetch` CLI（基於 [Typer](https://typer.tiangolo.com/)）
@@ -110,6 +110,30 @@ export NEXTCLOUD_PUBLIC_PASSWORD=YourSharePassword
 $env:NEXTCLOUD_PUBLIC_PASSWORD = "YourSharePassword"
 
 ncfetch public-folder "https://<host>/s/<token>" "<folder>" --zip ./downloads/<zip_name>.zip
+```
+
+### 上傳
+
+上傳單一檔案（省略 `remote_path` 則放到帳號根目錄並沿用原檔名）：
+```bash
+ncfetch upload ./report.pdf "Backups/report.pdf"
+ncfetch upload ./report.pdf                       # → /report.pdf
+```
+
+上傳整個資料夾（本機資料夾的「內容」會放在 `remote_folder` 之下，可調並行數）：
+```bash
+ncfetch upload-folder ./dataset_2025 "Datasets/2025" -c 8
+```
+
+批次上傳多個檔案/資料夾到同一遠端資料夾（資料夾會以其名作為子層）：
+```bash
+ncfetch upload-batch ./a.csv ./b.png ./project_logs --to "Inbox/2026-05-16"
+```
+
+預設覆蓋既有檔案；加 `--no-overwrite` 可在遠端已存在時中止：
+```bash
+ncfetch upload ./report.pdf "Backups/report.pdf" --no-overwrite
+ncfetch upload-folder ./dataset "Datasets/raw" --no-overwrite
 ```
 
 完整指令列表：`ncfetch --help`、各子指令 `ncfetch <command> --help`。

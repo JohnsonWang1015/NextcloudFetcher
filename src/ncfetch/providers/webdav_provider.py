@@ -1,7 +1,8 @@
 from __future__ import annotations
 import asyncio
 from pathlib import Path
-from typing import AsyncIterator, Callable, List, Optional, Tuple
+from typing import AsyncIterator, Callable, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 import httpx
 from tqdm import tqdm
@@ -19,6 +20,8 @@ class WebDAVProvider(StorageProvider):
     - 檔案下載：直接 GET /remote.php/dav/files/<user>/<path>
     - 資料夾下載：對資料夾路徑送 GET，並加 Accept: application/zip (Nextcloud 會回 ZIP)
     - 鏡像下載 / 列目錄：用 PROPFIND 走遠端樹
+    - 檔案上傳：PUT /remote.php/dav/files/<user>/<path>
+    - 資料夾上傳：MKCOL 建立目錄樹 + 對每個檔案 PUT (可並行)
     """
 
     def __init__(self, settings: Settings):
@@ -34,6 +37,10 @@ class WebDAVProvider(StorageProvider):
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(verify=self.verify, auth=self.auth, timeout=self.timeout)
+
+    def _build_url_quoted(self, remote_path: str) -> str:
+        """URL-encode remote path segments (上傳時用，避免空白/中文導致 400)."""
+        return f"{self.base}/{quote(remote_path.lstrip('/'), safe='/')}"
 
     async def _stream(self, client: httpx.AsyncClient, url: str, headers: dict | None = None) -> AsyncIterator[bytes]:
         async with client.stream("GET", url, headers=headers) as resp:
@@ -83,6 +90,199 @@ class WebDAVProvider(StorageProvider):
                 local_dir=local_dir,
                 workers=workers,
             )
+
+    # ---------- 上傳：目錄與檔案 ----------
+
+    async def _mkcol_one(self, client: httpx.AsyncClient, remote_dir: str) -> None:
+        """對單一層級執行 MKCOL；視 201/405 皆為 OK (已存在)。"""
+        url = self._build_url_quoted(remote_dir)
+        resp = await client.request("MKCOL", url)
+        # 201 Created；405 表示已存在 (Nextcloud 對已存在的 collection 回 405)
+        if resp.status_code in (201, 405):
+            return
+        resp.raise_for_status()
+
+    async def ensure_remote_dir(self, client: httpx.AsyncClient, remote_dir: str) -> None:
+        """逐層 MKCOL 建立資料夾 (idempotent)。空字串視為根，直接略過。"""
+        parts = [p for p in remote_dir.strip("/").split("/") if p]
+        cur = ""
+        for p in parts:
+            cur = f"{cur}/{p}" if cur else p
+            await self._mkcol_one(client, cur)
+
+    async def _put_file(
+        self,
+        client: httpx.AsyncClient,
+        local_path: Path,
+        remote_path: str,
+        *,
+        overwrite: bool,
+        progress_desc: str | None = None,
+    ) -> None:
+        url = self._build_url_quoted(remote_path)
+
+        if not overwrite:
+            head = await client.head(url)
+            if head.status_code == 200:
+                raise FileExistsError(f"遠端檔案已存在：{remote_path}")
+
+        size = local_path.stat().st_size
+        desc = progress_desc or local_path.name
+
+        with tqdm(
+            total=size, unit="B", unit_scale=True, desc=desc, dynamic_ncols=True, leave=False
+        ) as bar:
+            async def body() -> AsyncIterator[bytes]:
+                f = await asyncio.to_thread(open, local_path, "rb")
+                try:
+                    while True:
+                        chunk = await asyncio.to_thread(f.read, CHUNK)
+                        if not chunk:
+                            break
+                        bar.update(len(chunk))
+                        yield chunk
+                finally:
+                    await asyncio.to_thread(f.close)
+
+            # 帶 Content-Length，部分伺服器與反向代理會更穩
+            headers = {"Content-Length": str(size)}
+            resp = await client.put(url, content=body(), headers=headers)
+            resp.raise_for_status()
+
+    async def upload_file(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        overwrite: bool = True,
+        ensure_parent: bool = True,
+    ) -> None:
+        if not local_path.exists() or not local_path.is_file():
+            raise FileNotFoundError(f"找不到本機檔案：{local_path}")
+
+        async with self._client() as client:
+            if ensure_parent:
+                parent = "/".join(remote_path.lstrip("/").split("/")[:-1])
+                if parent:
+                    await self.ensure_remote_dir(client, parent)
+            await self._put_file(client, local_path, remote_path, overwrite=overwrite)
+
+    async def upload_folder(
+        self,
+        local_folder: Path,
+        remote_folder: str,
+        *,
+        concurrency: int = 4,
+        overwrite: bool = True,
+    ) -> None:
+        if not local_folder.exists() or not local_folder.is_dir():
+            raise NotADirectoryError(f"找不到本機資料夾：{local_folder}")
+
+        files: List[Path] = sorted(p for p in local_folder.rglob("*") if p.is_file())
+        subdirs: List[Path] = sorted(
+            (p for p in local_folder.rglob("*") if p.is_dir()),
+            key=lambda p: len(p.relative_to(local_folder).parts),
+        )
+        remote_root = remote_folder.strip("/")
+
+        async with self._client() as client:
+            if remote_root:
+                await self.ensure_remote_dir(client, remote_root)
+            for d in subdirs:
+                rel = d.relative_to(local_folder).as_posix()
+                target_dir = f"{remote_root}/{rel}" if remote_root else rel
+                await self.ensure_remote_dir(client, target_dir)
+
+            sem = asyncio.Semaphore(max(1, concurrency))
+            outer = tqdm(
+                total=len(files),
+                unit="file",
+                desc=f"Uploading → /{remote_root}" if remote_root else "Uploading → /",
+                dynamic_ncols=True,
+            )
+
+            async def one(local_file: Path) -> None:
+                rel = local_file.relative_to(local_folder).as_posix()
+                target = f"{remote_root}/{rel}" if remote_root else rel
+                async with sem:
+                    await self._put_file(
+                        client, local_file, target, overwrite=overwrite, progress_desc=rel
+                    )
+                outer.update(1)
+                outer.set_postfix_str(rel[-60:])
+
+            try:
+                await asyncio.gather(*(one(p) for p in files))
+            finally:
+                outer.close()
+
+    async def upload_many(
+        self,
+        sources: Sequence[Path],
+        remote_folder: str,
+        *,
+        concurrency: int = 4,
+        overwrite: bool = True,
+    ) -> None:
+        """
+        批次上傳一組來源 (檔案或資料夾) 到指定遠端資料夾下。
+        - 檔案：上傳到 <remote_folder>/<檔名>
+        - 資料夾：以該資料夾名作為子目錄，遞迴上傳其下所有檔案
+        """
+        plan: List[Tuple[Path, str]] = []
+        dirs_to_make: List[str] = []
+        remote_root = remote_folder.strip("/")
+        if remote_root:
+            dirs_to_make.append(remote_root)
+
+        for src in sources:
+            if not src.exists():
+                raise FileNotFoundError(f"找不到來源：{src}")
+            if src.is_file():
+                target = f"{remote_root}/{src.name}" if remote_root else src.name
+                plan.append((src, target))
+            elif src.is_dir():
+                top = src.name
+                top_remote = f"{remote_root}/{top}" if remote_root else top
+                dirs_to_make.append(top_remote)
+                for sub in sorted(p for p in src.rglob("*") if p.is_dir()):
+                    rel = sub.relative_to(src).as_posix()
+                    dirs_to_make.append(f"{top_remote}/{rel}")
+                for f in sorted(p for p in src.rglob("*") if p.is_file()):
+                    rel = f.relative_to(src).as_posix()
+                    plan.append((f, f"{top_remote}/{rel}"))
+            else:
+                raise ValueError(f"不支援的來源類型：{src}")
+
+        async with self._client() as client:
+            # 依深度建立目錄 (淺者優先)，去重避免重複呼叫
+            seen: set[str] = set()
+            for d in sorted(dirs_to_make, key=lambda s: len(s.split("/"))):
+                if d and d not in seen:
+                    await self.ensure_remote_dir(client, d)
+                    seen.add(d)
+
+            sem = asyncio.Semaphore(max(1, concurrency))
+            outer = tqdm(
+                total=len(plan),
+                unit="file",
+                desc=f"Batch uploading → /{remote_root}" if remote_root else "Batch uploading → /",
+                dynamic_ncols=True,
+            )
+
+            async def one(item: Tuple[Path, str]) -> None:
+                local_file, target = item
+                async with sem:
+                    await self._put_file(
+                        client, local_file, target, overwrite=overwrite, progress_desc=target
+                    )
+                outer.update(1)
+                outer.set_postfix_str(target[-60:])
+
+            try:
+                await asyncio.gather(*(one(item) for item in plan))
+            finally:
+                outer.close()
 
 
 async def download_tree(

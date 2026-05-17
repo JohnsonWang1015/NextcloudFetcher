@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 import typer
 
@@ -15,7 +15,7 @@ from .webdav_dav import DAVEntry
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
-app = typer.Typer(help="Nextcloud Downloader (WebDAV) — 檔案/資料夾下載 (資料夾輸出為 ZIP，可選自動解壓)")
+app = typer.Typer(help="Nextcloud Fetcher (WebDAV) — 檔案/資料夾下載與上傳 (資料夾下載輸出為 ZIP，可選自動解壓)")
 
 # 解析 public share 密碼：優先 CLI -> 環境變數 -> 空字串
 def _public_pwd(cli_pwd: Optional[str]) -> str:
@@ -190,5 +190,69 @@ def public_mirror_folder(
     async def run():
         await provider.download_folder_tree(remote_folder, out_dir, workers=workers)
         typer.echo(f"✅ 鏡像完成：{out_dir}")
+
+    asyncio.run(run())
+
+
+# ===================== 上傳 =====================
+
+@app.command("upload")
+def upload_file_cmd(
+    local_path: Path = typer.Argument(..., exists=True, file_okay=True, dir_okay=False, help="本機檔案路徑"),
+    remote_path: Optional[str] = typer.Argument(None, help="遠端目標路徑 (含檔名)，例如 'Backups/photo.jpg'；省略則放到根目錄並沿用原檔名"),
+    no_overwrite: bool = typer.Option(False, "--no-overwrite", help="若遠端已存在則中止 (預設覆蓋)"),
+):
+    """上傳單一檔案到 Nextcloud。"""
+    s = get_settings()
+    provider = WebDAVProvider(s)
+
+    target = remote_path or local_path.name
+
+    async def run():
+        await provider.upload_file(
+            local_path, target, overwrite=not no_overwrite
+        )
+        typer.echo(f"✅ 已上傳：{local_path} → /{target.lstrip('/')}")
+
+    asyncio.run(run())
+
+
+@app.command("upload-folder")
+def upload_folder_cmd(
+    local_folder: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True, help="本機資料夾路徑"),
+    remote_folder: str = typer.Argument(..., help="遠端目標資料夾，例如 'Backups/2026'"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數 (預設 4)"),
+    no_overwrite: bool = typer.Option(False, "--no-overwrite", help="若遠端檔案已存在則中止 (預設覆蓋)"),
+):
+    """遞迴上傳整個資料夾到 Nextcloud (本機資料夾的內容會放在 remote_folder 之下)。"""
+    s = get_settings()
+    provider = WebDAVProvider(s)
+
+    async def run():
+        await provider.upload_folder(
+            local_folder, remote_folder,
+            concurrency=concurrency, overwrite=not no_overwrite,
+        )
+        typer.echo(f"✅ 資料夾已上傳：{local_folder} → /{remote_folder.strip('/')}")
+
+    asyncio.run(run())
+
+
+@app.command("upload-batch")
+def upload_batch_cmd(
+    sources: List[Path] = typer.Argument(..., exists=True, help="多個本機檔案或資料夾路徑 (可混合)"),
+    to: str = typer.Option(..., "--to", "-t", help="遠端目標資料夾，所有來源放在此資料夾之下"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數 (預設 4)"),
+    no_overwrite: bool = typer.Option(False, "--no-overwrite", help="若遠端檔案已存在則中止 (預設覆蓋)"),
+):
+    """批次上傳多個檔案/資料夾到指定遠端資料夾。資料夾會保留結構放到 <to>/<資料夾名>/。"""
+    s = get_settings()
+    provider = WebDAVProvider(s)
+
+    async def run():
+        await provider.upload_many(
+            sources, to, concurrency=concurrency, overwrite=not no_overwrite
+        )
+        typer.echo(f"✅ 批次上傳完成 ({len(sources)} 個來源) → /{to.strip('/')}")
 
     asyncio.run(run())
