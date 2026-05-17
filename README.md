@@ -15,16 +15,16 @@
 
 ```bash
 # uv
-uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.1.1"
+uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
 
 # 加進另一個 uv 專案的相依
-uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.1.1"
+uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
 
 # 純 pip
-pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.1.1"
+pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
 
 # 隔離安裝為全域 CLI（類似 pipx）
-uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.1.1"
+uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
 ```
 
 > Private repo 的話請改用 SSH (`git+ssh://git@github.com/...`) 或在 URL 帶入 PAT。
@@ -143,7 +143,7 @@ ncfetch upload-folder ./dataset "Datasets/raw" --no-overwrite
 ### 升級
 
 ```bash
-uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.1.1"
+uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.0"
 ```
 
-或把上面 `@v0.1.1` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。
+或把上面 `@v0.2.0` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。
