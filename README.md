@@ -112,6 +112,25 @@ $env:NEXTCLOUD_PUBLIC_PASSWORD = "YourSharePassword"
 ncfetch public-folder "https://<host>/s/<token>" "<folder>" --zip ./downloads/<zip_name>.zip
 ```
 
+### 列目錄 / 鏡像下載
+
+列出遠端資料夾內容（留空為帳號根目錄）：
+```bash
+ncfetch ls "Datasets/2025"
+ncfetch ls                       # 列出根目錄
+```
+
+鏡像下載——保留樹狀結構同步到本機（不打成 ZIP），可調並行數：
+```bash
+ncfetch mirror "Datasets/2025" -o ./mirror/2025 -w 16
+```
+
+公開分享版本（同樣支援 token 或完整 URL，可帶 `-p` 密碼）：
+```bash
+ncfetch public-ls "<token>" "<sub_folder>"
+ncfetch public-mirror "<token>" "<folder>" -o ./mirror/share -w 8
+```
+
 ### 上傳
 
 上傳單一檔案（省略 `remote_path` 則放到帳號根目錄並沿用原檔名）：

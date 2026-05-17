@@ -9,3 +9,5 @@ downloads/
 *.egg-info/
 dist/
 build/
+graphify-out/
+.pytest_cache/
