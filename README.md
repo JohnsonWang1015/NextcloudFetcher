@@ -59,7 +59,7 @@ NEXTCLOUD_PUBLIC_PASSWORD=
 NEXTCLOUD_WEBDAV_ROOT=
 
 # 選填 — 是否驗證 TLS 憑證（true/false 或自訂 CA bundle 路徑）
-NEXTCLOUD_VERIFY_SSL=true
+NEXTCLOUD_VERIFY_SSL=false
 
 # 選填 — HTTP 請求 timeout (秒)
 REQUEST_TIMEOUT=60
