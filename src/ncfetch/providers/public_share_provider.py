@@ -1,18 +1,23 @@
 from __future__ import annotations
 import asyncio
 import logging
-import tempfile
 from pathlib import Path
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, List, Optional
 import httpx
 from urllib.parse import quote
-from zipfile import ZipFile, ZIP_DEFLATED
-from tqdm import tqdm
 
 from ..config import Settings
 from ..provider_base import StorageProvider
 from ..webdav_dav import DAVEntry, propfind, parse_propfind
-from .webdav_provider import download_tree
+from .webdav_provider import (
+    _is_zip_response,
+    build_folder_zip_via_propfind,
+    download_tree,
+)
+
+# Re-exported so existing imports keep working:
+#   from ncfetch.providers.public_share_provider import _is_zip_response
+__all__ = ["PublicShareProvider", "_extract_token", "_is_zip_response"]
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +31,6 @@ def _extract_token(token_or_url: str) -> str:
     if "?" in t:
         t = t.split("?", 1)[0]
     return t
-
-
-def _is_zip_response(resp: httpx.Response) -> bool:
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    cd = (resp.headers.get("Content-Disposition") or "").lower()
-    if "application/zip" in ct:
-        return True
-    if "attachment" in cd and ".zip" in cd:
-        return True
-    return False
 
 
 class PublicShareProvider(StorageProvider):
@@ -203,62 +198,17 @@ class PublicShareProvider(StorageProvider):
     async def _download_folder_zip_via_recursive_webdav(
         self, remote_folder: str, local_zip_path: Path, workers: int = 8
     ) -> None:
+        """Public WebDAV 遞迴 PROPFIND + 並行下載 + 序列寫 ZIP。
+
+        Delegates to the shared build_folder_zip_via_propfind helper — same
+        logic is used by WebDAVProvider tier-2; only the url_builder differs.
         """
-        Public WebDAV 遞迴 PROPFIND 列出所有檔案，並行下載到 tempfile，
-        再序列寫入單一 ZipFile (ZipFile 非 thread-safe，寫入必須序列化)。
-        """
-        base_dir = remote_folder.strip("/")
         async with self._client(follow_redirects=True) as client:
-            files: List[Tuple[str, Optional[int]]] = []
-            dirs: List[str] = []
-            queue: List[str] = [base_dir]
-            while queue:
-                cur = queue.pop(0)
-                cur_url = self._build_webdav_url(cur)
-                resp = await propfind(client, cur_url, depth=1)
-                resp.raise_for_status()
-                entries = parse_propfind(
-                    cur_url if cur_url.endswith("/") else cur_url + "/", resp.content
-                )
-                for entry in entries:
-                    full = f"{cur}/{entry.rel_path}".strip("/") if cur else entry.rel_path
-                    if entry.is_dir:
-                        queue.append(full)
-                        dirs.append(full)
-                    else:
-                        files.append((full, entry.size))
-
-            sem = asyncio.Semaphore(workers)
-            write_lock = asyncio.Lock()
-
-            with ZipFile(local_zip_path, mode="w", compression=ZIP_DEFLATED) as zf:
-                for d in dirs:
-                    zf.writestr(d.rstrip("/") + "/", b"")
-
-                with tqdm(
-                    total=len(files), unit="file",
-                    desc="Downloading (WebDAV→ZIP)", dynamic_ncols=True,
-                ) as bar:
-                    async def fetch_and_pack(full_path: str) -> None:
-                        url = self._build_webdav_url(full_path)
-                        async with sem:
-                            tmp = tempfile.NamedTemporaryFile(delete=False)
-                            tmp_path = Path(tmp.name)
-                            try:
-                                async with client.stream("GET", url) as fresp:
-                                    fresp.raise_for_status()
-                                    async for chunk in fresp.aiter_bytes(chunk_size=CHUNK):
-                                        await asyncio.to_thread(tmp.write, chunk)
-                                await asyncio.to_thread(tmp.close)
-                                async with write_lock:
-                                    await asyncio.to_thread(
-                                        zf.write, str(tmp_path), arcname=full_path
-                                    )
-                            finally:
-                                if not tmp.closed:
-                                    await asyncio.to_thread(tmp.close)
-                                tmp_path.unlink(missing_ok=True)
-                        bar.update(1)
-                        bar.set_postfix_str(full_path[-60:])
-
-                    await asyncio.gather(*(fetch_and_pack(p) for p, _ in files))
+            await build_folder_zip_via_propfind(
+                client=client,
+                url_builder=self._build_webdav_url,
+                remote_folder=remote_folder,
+                local_zip_path=local_zip_path,
+                workers=workers,
+                desc="Downloading (Public WebDAV→ZIP)",
+            )

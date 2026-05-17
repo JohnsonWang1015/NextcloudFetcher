@@ -1,8 +1,11 @@
 from __future__ import annotations
 import asyncio
+import logging
+import tempfile
 from pathlib import Path
 from typing import AsyncIterator, Callable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import httpx
 from tqdm import tqdm
@@ -11,7 +14,24 @@ from ..config import Settings
 from ..provider_base import StorageProvider
 from ..webdav_dav import DAVEntry, propfind, parse_propfind
 
+logger = logging.getLogger(__name__)
+
 CHUNK = 1024 * 1024  # 1MB
+
+
+def _is_zip_response(resp: httpx.Response) -> bool:
+    """Sniff whether an HTTP response is actually a ZIP payload.
+
+    Some Nextcloud builds/proxies return application/octet-stream with a .zip
+    Content-Disposition filename instead of application/zip, so check both.
+    """
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    cd = (resp.headers.get("Content-Disposition") or "").lower()
+    if "application/zip" in ct:
+        return True
+    if "attachment" in cd and ".zip" in cd:
+        return True
+    return False
 
 
 class WebDAVProvider(StorageProvider):
@@ -32,15 +52,18 @@ class WebDAVProvider(StorageProvider):
         self.timeout = httpx.Timeout(settings.request_timeout)
 
     def _build_url(self, remote_path: str) -> str:
+        """URL-encode path segments; safe='/' preserves separators."""
         remote_path = remote_path.lstrip("/")
-        return f"{self.base}/{remote_path}" if remote_path else self.base
+        if not remote_path:
+            return self.base
+        return f"{self.base}/{quote(remote_path, safe='/')}"
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(verify=self.verify, auth=self.auth, timeout=self.timeout)
 
-    def _build_url_quoted(self, remote_path: str) -> str:
-        """URL-encode remote path segments (上傳時用，避免空白/中文導致 400)."""
-        return f"{self.base}/{quote(remote_path.lstrip('/'), safe='/')}"
+    # Kept as an alias for callers that historically used the "quoted" name. Both
+    # forms now percent-encode — _build_url and _build_url_quoted are equivalent.
+    _build_url_quoted = _build_url
 
     async def _stream(self, client: httpx.AsyncClient, url: str, headers: dict | None = None) -> AsyncIterator[bytes]:
         async with client.stream("GET", url, headers=headers) as resp:
@@ -59,18 +82,78 @@ class WebDAVProvider(StorageProvider):
             finally:
                 await asyncio.to_thread(f.close)
 
-    async def download_folder_zip(self, remote_folder: str, local_zip_path: Path) -> None:
-        # Nextcloud 對資料夾做 GET + Accept: application/zip 會回 zip 檔
+    async def download_folder_zip(
+        self, remote_folder: str, local_zip_path: Path, workers: int = 8
+    ) -> None:
+        """Two-tier folder ZIP download.
+
+        Tier 1: GET <user-webdav>/<folder> with Accept: application/zip and
+                validate the response is actually a ZIP. Some Nextcloud builds
+                honor this and serve a server-built ZIP; others return an HTML
+                or WebDAV directory listing — those are sniffed and rejected.
+
+        Tier 2: recursive PROPFIND + parallel file downloads + local ZIP
+                packing (the always-works fallback).
+        """
+        local_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tiers = [
+            ("user WebDAV zip", lambda: self._download_folder_zip_via_webdav(remote_folder, local_zip_path)),
+            ("recursive PROPFIND", lambda: self._download_folder_zip_via_recursive(remote_folder, local_zip_path, workers)),
+        ]
+        last_exc: Optional[BaseException] = None
+        for i, (name, fn) in enumerate(tiers):
+            try:
+                await fn()
+                return
+            except Exception as e:
+                local_zip_path.unlink(missing_ok=True)
+                last_exc = e
+                if i < len(tiers) - 1:
+                    logger.warning("Tier %d (%s) 失敗，改試下一個策略: %s", i + 1, name, e)
+                else:
+                    logger.error("所有 fallback 策略皆失敗，最後一個錯誤：%s", e)
+        assert last_exc is not None
+        raise last_exc
+
+    async def _download_folder_zip_via_webdav(
+        self, remote_folder: str, local_zip_path: Path
+    ) -> None:
+        """Tier 1: user WebDAV GET + Accept: application/zip, sniff before writing."""
         url = self._build_url(remote_folder.rstrip("/"))
         headers = {"Accept": "application/zip"}
-        local_zip_path.parent.mkdir(parents=True, exist_ok=True)
         async with self._client() as client:
-            f = await asyncio.to_thread(open, local_zip_path, "wb")
-            try:
-                async for chunk in self._stream(client, url, headers=headers):
-                    await asyncio.to_thread(f.write, chunk)
-            finally:
-                await asyncio.to_thread(f.close)
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                if not _is_zip_response(resp):
+                    head = await resp.aread(2048)
+                    text_head = head.decode(errors="ignore").lower()
+                    if "<html" in text_head or "<?xml" in text_head or "multistatus" in text_head:
+                        raise RuntimeError("使用者 WebDAV 未回 ZIP (疑似 HTML/XML 目錄列表)。")
+                    raise RuntimeError(
+                        f"WebDAV 回應非 ZIP (Content-Type={resp.headers.get('Content-Type')})."
+                    )
+
+                f = await asyncio.to_thread(open, local_zip_path, "wb")
+                try:
+                    async for chunk in resp.aiter_bytes(chunk_size=CHUNK):
+                        await asyncio.to_thread(f.write, chunk)
+                finally:
+                    await asyncio.to_thread(f.close)
+
+    async def _download_folder_zip_via_recursive(
+        self, remote_folder: str, local_zip_path: Path, workers: int
+    ) -> None:
+        """Tier 2: PROPFIND walk + parallel temp downloads + serial ZIP write."""
+        async with self._client() as client:
+            await build_folder_zip_via_propfind(
+                client=client,
+                url_builder=self._build_url,
+                remote_folder=remote_folder,
+                local_zip_path=local_zip_path,
+                workers=workers,
+                desc="Downloading (WebDAV→ZIP)",
+            )
 
     async def list_folder(self, remote_folder: str) -> List[DAVEntry]:
         url = self._build_url(remote_folder.strip("/"))
@@ -349,3 +432,87 @@ def _strip_base(full: str, base: str) -> str:
     if full.startswith(base + "/"):
         return full[len(base) + 1:]
     return full
+
+
+async def _walk_propfind(
+    *,
+    client: httpx.AsyncClient,
+    url_builder: Callable[[str], str],
+    base_dir: str,
+) -> Tuple[List[Tuple[str, Optional[int]]], List[str]]:
+    """Recursive PROPFIND walk. Returns (files, dirs) with paths relative to share root."""
+    files: List[Tuple[str, Optional[int]]] = []
+    dirs: List[str] = []
+    queue: List[str] = [base_dir]
+    while queue:
+        cur = queue.pop(0)
+        cur_url = url_builder(cur)
+        resp = await propfind(client, cur_url, depth=1)
+        resp.raise_for_status()
+        entries = parse_propfind(
+            cur_url if cur_url.endswith("/") else cur_url + "/", resp.content
+        )
+        for entry in entries:
+            full = f"{cur}/{entry.rel_path}".strip("/") if cur else entry.rel_path
+            if entry.is_dir:
+                queue.append(full)
+                dirs.append(full)
+            else:
+                files.append((full, entry.size))
+    return files, dirs
+
+
+async def build_folder_zip_via_propfind(
+    *,
+    client: httpx.AsyncClient,
+    url_builder: Callable[[str], str],
+    remote_folder: str,
+    local_zip_path: Path,
+    workers: int,
+    desc: str = "Downloading (WebDAV→ZIP)",
+) -> None:
+    """PROPFIND walk → parallel temp downloads → serial ZipFile write.
+
+    Shared between WebDAVProvider (user auth) and PublicShareProvider (token
+    auth). The url_builder callback hides the auth/path-shape difference.
+
+    The asyncio.Lock around zf.write(...) is load-bearing: zipfile.ZipFile is
+    not thread/coroutine-safe. Removing the lock will silently corrupt the
+    central directory under any parallelism.
+    """
+    base_dir = remote_folder.strip("/")
+    files, dirs = await _walk_propfind(
+        client=client, url_builder=url_builder, base_dir=base_dir,
+    )
+
+    sem = asyncio.Semaphore(workers)
+    write_lock = asyncio.Lock()
+
+    with ZipFile(local_zip_path, mode="w", compression=ZIP_DEFLATED) as zf:
+        for d in dirs:
+            zf.writestr(d.rstrip("/") + "/", b"")
+
+        with tqdm(total=len(files), unit="file", desc=desc, dynamic_ncols=True) as bar:
+            async def fetch_and_pack(full_path: str) -> None:
+                url = url_builder(full_path)
+                async with sem:
+                    tmp = tempfile.NamedTemporaryFile(delete=False)
+                    tmp_path = Path(tmp.name)
+                    try:
+                        async with client.stream("GET", url) as fresp:
+                            fresp.raise_for_status()
+                            async for chunk in fresp.aiter_bytes(chunk_size=CHUNK):
+                                await asyncio.to_thread(tmp.write, chunk)
+                        await asyncio.to_thread(tmp.close)
+                        async with write_lock:
+                            await asyncio.to_thread(
+                                zf.write, str(tmp_path), arcname=full_path
+                            )
+                    finally:
+                        if not tmp.closed:
+                            await asyncio.to_thread(tmp.close)
+                        tmp_path.unlink(missing_ok=True)
+                bar.update(1)
+                bar.set_postfix_str(full_path[-60:])
+
+            await asyncio.gather(*(fetch_and_pack(p) for p, _ in files))

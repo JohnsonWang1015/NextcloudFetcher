@@ -12,7 +12,9 @@ class StorageProvider(ABC):
         ...
 
     @abstractmethod
-    async def download_folder_zip(self, remote_folder: str, local_zip_path: Path) -> None:
+    async def download_folder_zip(
+        self, remote_folder: str, local_zip_path: Path, workers: int = 8
+    ) -> None:
         ...
 
     @abstractmethod

@@ -68,13 +68,14 @@ def download_folder(
     remote_folder: str = typer.Argument(..., help="遠端資料夾相對路徑，例如: 'Datasets/flood-tiles'"),
     out_zip: Path = typer.Option(Path("./downloads/folder.zip"), "--zip", help="ZIP 存檔路徑"),
     unzip_to: Path | None = typer.Option(None, "--unzip-to", help="自動解壓縮到此資料夾（可選）"),
+    workers: int = typer.Option(8, "--workers", "-w", min=1, max=64, help="tier-2 並行下載數"),
 ):
-    """下載整個資料夾 (Nextcloud 會回 ZIP 檔)，可選擇自動解壓。"""
+    """下載整個資料夾。優先讓伺服器回 ZIP，若伺服器不支援就 PROPFIND 遞迴下載並在本機打包。"""
     s = get_settings()
     provider = WebDAVProvider(s)
 
     async def run():
-        await provider.download_folder_zip(remote_folder, out_zip)
+        await provider.download_folder_zip(remote_folder, out_zip, workers=workers)
         typer.echo(f"✅ 資料夾 ZIP 已下載：{out_zip}")
         if unzip_to:
             unzip(out_zip, unzip_to)
