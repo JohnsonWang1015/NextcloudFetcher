@@ -11,3 +11,4 @@ dist/
 build/
 graphify-out/
 .pytest_cache/
+CLAUDE.md
