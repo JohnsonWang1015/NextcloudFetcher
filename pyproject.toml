@@ -8,6 +8,11 @@ version = "0.2.1"
 description = "Nextcloud file or folder fetcher/downloader"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Johnson Wang", email = "a0903809066@gmail.com" },
+]
 dependencies = [
     "httpx",
     "nextcloud-api-wrapper",
