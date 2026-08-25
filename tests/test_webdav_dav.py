@@ -82,3 +82,35 @@ def test_base_url_without_trailing_slash_still_matches():
     )
     entries = parse_propfind("https://h/dav/F", xml)
     assert [e.rel_path for e in entries] == ["a.txt"]
+
+
+# ---------- getlastmodified ----------
+
+
+def test_mtime_is_parsed_as_tz_aware():
+    xml = _xml(
+        '<d:response><d:href>/dav/f.txt</d:href><d:propstat><d:prop>'
+        '<d:resourcetype/><d:getcontentlength>5</d:getcontentlength>'
+        '<d:getlastmodified>Tue, 20 May 2025 08:00:00 GMT</d:getlastmodified>'
+        '</d:prop></d:propstat></d:response>'
+    )
+    (e,) = parse_propfind("https://h/dav/", xml)
+    assert e.mtime is not None
+    assert e.mtime.tzinfo is not None
+    assert (e.mtime.year, e.mtime.month, e.mtime.day) == (2025, 5, 20)
+
+
+def test_missing_mtime_is_none():
+    xml = _xml(_resp("/dav/f.txt", size=5))
+    (e,) = parse_propfind("https://h/dav/", xml)
+    assert e.mtime is None
+
+
+def test_unparseable_mtime_degrades_to_none_instead_of_raising():
+    xml = _xml(
+        '<d:response><d:href>/dav/f.txt</d:href><d:propstat><d:prop>'
+        '<d:resourcetype/><d:getlastmodified>not-a-date</d:getlastmodified>'
+        '</d:prop></d:propstat></d:response>'
+    )
+    (e,) = parse_propfind("https://h/dav/", xml)
+    assert e.mtime is None

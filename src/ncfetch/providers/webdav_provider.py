@@ -12,6 +12,16 @@ from tqdm import tqdm
 
 from ..config import Settings
 from ..provider_base import StorageProvider
+from ..search import (
+    FindSpec,
+    GrepMatch,
+    GrepSpec,
+    GrepStats,
+    RemoteFile,
+    find_entries,
+    grep_tree,
+    walk_propfind,
+)
 from ..webdav_dav import DAVEntry, propfind, parse_propfind
 
 logger = logging.getLogger(__name__)
@@ -39,7 +49,7 @@ class WebDAVProvider(StorageProvider):
     以 Nextcloud WebDAV 實作：
     - 檔案下載：直接 GET /remote.php/dav/files/<user>/<path>
     - 資料夾下載：對資料夾路徑送 GET，並加 Accept: application/zip (Nextcloud 會回 ZIP)
-    - 鏡像下載 / 列目錄：用 PROPFIND 走遠端樹
+    - 鏡像下載 / 列目錄 / find / grep：用 PROPFIND 走遠端樹
     - 檔案上傳：PUT /remote.php/dav/files/<user>/<path>
     - 資料夾上傳：MKCOL 建立目錄樹 + 對每個檔案 PUT (可並行)
     """
@@ -172,6 +182,45 @@ class WebDAVProvider(StorageProvider):
                 remote_folder=remote_folder,
                 local_dir=local_dir,
                 workers=workers,
+            )
+
+    # ---------- 搜尋：檔名 (find) 與內容 (grep) ----------
+
+    async def stream_file(self, remote_path: str) -> AsyncIterator[bytes]:
+        """Yield a remote file's bytes without touching disk (backs `ncfetch cat`)."""
+        url = self._build_url(remote_path)
+        async with self._client() as client:
+            async for chunk in self._stream(client, url):
+                yield chunk
+
+    async def walk(self, remote_folder: str = "") -> Tuple[List[RemoteFile], List[RemoteFile]]:
+        async with self._client() as client:
+            return await walk_propfind(
+                client=client, url_builder=self._build_url,
+                base_dir=remote_folder.strip("/"),
+            )
+
+    async def find(self, remote_folder: str, spec: FindSpec) -> List[RemoteFile]:
+        async with self._client() as client:
+            return await find_entries(
+                client=client, url_builder=self._build_url,
+                remote_folder=remote_folder, spec=spec,
+            )
+
+    async def grep(
+        self,
+        remote_folder: str,
+        spec: GrepSpec,
+        *,
+        workers: int = 8,
+        on_file_result: Optional[Callable[[str, List[GrepMatch]], None]] = None,
+        progress: bool = True,
+    ) -> GrepStats:
+        async with self._client() as client:
+            return await grep_tree(
+                client=client, url_builder=self._build_url,
+                remote_folder=remote_folder, spec=spec, workers=workers,
+                on_file_result=on_file_result, progress=progress,
             )
 
     # ---------- 上傳：目錄與檔案 ----------
@@ -384,23 +433,11 @@ async def download_tree(
     base_rel = remote_folder.strip("/")
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    files: List[Tuple[str, Optional[int]]] = []
-    queue: List[str] = [base_rel]
-    while queue:
-        cur = queue.pop(0)
-        cur_url = url_builder(cur)
-        resp = await propfind(client, cur_url, depth=1)
-        resp.raise_for_status()
-        entries = parse_propfind(
-            cur_url if cur_url.endswith("/") else cur_url + "/", resp.content
-        )
-        for entry in entries:
-            full = f"{cur}/{entry.rel_path}".strip("/") if cur else entry.rel_path
-            if entry.is_dir:
-                queue.append(full)
-                (local_dir / _strip_base(full, base_rel)).mkdir(parents=True, exist_ok=True)
-            else:
-                files.append((full, entry.size))
+    files, dirs = await walk_propfind(
+        client=client, url_builder=url_builder, base_dir=base_rel
+    )
+    for d in dirs:
+        (local_dir / _strip_base(d.path, base_rel)).mkdir(parents=True, exist_ok=True)
 
     sem = asyncio.Semaphore(workers)
 
@@ -421,7 +458,7 @@ async def download_tree(
                         await asyncio.to_thread(f.close)
             bar.update(1)
 
-        await asyncio.gather(*(fetch_one(p) for p, _ in files))
+        await asyncio.gather(*(fetch_one(f.path) for f in files))
 
 
 def _strip_base(full: str, base: str) -> str:
@@ -434,32 +471,9 @@ def _strip_base(full: str, base: str) -> str:
     return full
 
 
-async def _walk_propfind(
-    *,
-    client: httpx.AsyncClient,
-    url_builder: Callable[[str], str],
-    base_dir: str,
-) -> Tuple[List[Tuple[str, Optional[int]]], List[str]]:
-    """Recursive PROPFIND walk. Returns (files, dirs) with paths relative to share root."""
-    files: List[Tuple[str, Optional[int]]] = []
-    dirs: List[str] = []
-    queue: List[str] = [base_dir]
-    while queue:
-        cur = queue.pop(0)
-        cur_url = url_builder(cur)
-        resp = await propfind(client, cur_url, depth=1)
-        resp.raise_for_status()
-        entries = parse_propfind(
-            cur_url if cur_url.endswith("/") else cur_url + "/", resp.content
-        )
-        for entry in entries:
-            full = f"{cur}/{entry.rel_path}".strip("/") if cur else entry.rel_path
-            if entry.is_dir:
-                queue.append(full)
-                dirs.append(full)
-            else:
-                files.append((full, entry.size))
-    return files, dirs
+# Canonical implementation now lives in ncfetch.search (shared with find/grep).
+# Kept under the old private name for callers that imported it from here.
+_walk_propfind = walk_propfind
 
 
 async def build_folder_zip_via_propfind(
@@ -490,7 +504,7 @@ async def build_folder_zip_via_propfind(
 
     with ZipFile(local_zip_path, mode="w", compression=ZIP_DEFLATED) as zf:
         for d in dirs:
-            zf.writestr(d.rstrip("/") + "/", b"")
+            zf.writestr(d.path.rstrip("/") + "/", b"")
 
         with tqdm(total=len(files), unit="file", desc=desc, dynamic_ncols=True) as bar:
             async def fetch_and_pack(full_path: str) -> None:
@@ -515,4 +529,4 @@ async def build_folder_zip_via_propfind(
                 bar.update(1)
                 bar.set_postfix_str(full_path[-60:])
 
-            await asyncio.gather(*(fetch_and_pack(p) for p, _ in files))
+            await asyncio.gather(*(fetch_and_pack(f.path) for f in files))

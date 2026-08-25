@@ -1,6 +1,6 @@
 ## Nextcloud Fetcher
 
-使用 Python，透過 Nextcloud **WebDAV** 與**公開分享 (public share)** 介面下載/上傳檔案或整個資料夾 (下載資料夾為 ZIP)，支援自動解壓縮與密碼分享。
+使用 Python，透過 Nextcloud **WebDAV** 與**公開分享 (public share)** 介面下載/上傳檔案或整個資料夾 (下載資料夾為 ZIP)，支援自動解壓縮與密碼分享，並可直接對遠端做**檔名搜尋 (`find`)** 與**全文搜尋 (`grep`)**。
 
 - Python 3.10+
 - 安裝後提供 `ncfetch` CLI（基於 [Typer](https://typer.tiangolo.com/)）
@@ -15,16 +15,16 @@
 
 ```bash
 # uv
-uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
+uv pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.3.0"
 
 # 加進另一個 uv 專案的相依
-uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
+uv add "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.3.0"
 
 # 純 pip
-pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
+pip install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.3.0"
 
 # 隔離安裝為全域 CLI（類似 pipx）
-uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
+uv tool install "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.3.0"
 ```
 
 > Private repo 的話請改用 SSH (`git+ssh://git@github.com/...`) 或在 URL 帶入 PAT。
@@ -115,10 +115,11 @@ ncfetch public-folder "https://<host>/s/<token>" "<folder>" --zip ./downloads/<z
 
 ### 列目錄 / 鏡像下載
 
-列出遠端資料夾內容（留空為帳號根目錄）：
+列出遠端資料夾內容（留空為帳號根目錄，`-l` 多顯示最後修改時間）：
 ```bash
 ncfetch ls "Datasets/2025"
 ncfetch ls                       # 列出根目錄
+ncfetch ls "Datasets/2025" -l    # 長格式：型態 / 大小 / 修改時間
 ```
 
 鏡像下載——保留樹狀結構同步到本機（不打成 ZIP），可調並行數：
@@ -130,6 +131,63 @@ ncfetch mirror "Datasets/2025" -o ./mirror/2025 -w 16
 ```bash
 ncfetch public-ls "<token>" "<sub_folder>"
 ncfetch public-mirror "<token>" "<folder>" -o ./mirror/share -w 8
+```
+
+### 搜尋：檔名 (`find`) 與全文 (`grep`)
+
+兩者都是**遞迴掃整棵遠端樹**，不需要先把檔案抓下來。
+
+#### `find` — 依檔名 / 大小 / 修改時間找檔案
+
+```bash
+ncfetch find "Datasets" --name "*.csv"            # glob，可重複給多個 --name
+ncfetch find --name "*.csv" --name "*.parquet"
+ncfetch find "Datasets" -e "20\d\d/raw/"          # 用 regex 比對相對路徑
+ncfetch find "Datasets" -t d                      # 只列資料夾 (f = 只列檔案)
+ncfetch find "Datasets" --min-size 10M            # 大於 10MB
+ncfetch find "Datasets" --newer 7d -l             # 近 7 天改過的，長格式輸出
+ncfetch find "Datasets" --older 90d --name "*.tmp"
+```
+
+`--name` 會同時比對「完整相對路徑」與「檔名」，所以 `--name '*.csv'` 和 `--name 'Datasets/*'` 都成立；加 `-i` 可忽略大小寫。大小可寫 `512` / `10K` / `5M` / `1.5G`，時間長度可寫 `30m` / `12h` / `7d` / `2w`。找不到任何項目時 exit code 為 `1`。
+
+#### `grep` — 直接搜尋檔案**內容**
+
+串流讀取遠端檔案並逐行比對，**不落地、不需先下載**；只有通過 `--include` / `--exclude` 與 `--max-size` 篩選的檔案才會真的被傳輸。
+
+```bash
+ncfetch grep "TODO" "Projects"                    # 基本用法 (PATTERN 是 regex)
+ncfetch grep "水位" "Datasets" -i                  # 忽略大小寫
+ncfetch grep "a.b.c" -F                           # -F：把 PATTERN 當純文字
+ncfetch grep "ERROR" "logs" --include "*.log"     # 只掃 .log
+ncfetch grep "ERROR" "logs" --exclude "*/archive/*"
+ncfetch grep "def main" "src" -C 2                # 顯示前後各 2 行
+ncfetch grep "TODO" -l                            # 只列出有命中的檔案路徑
+ncfetch grep "TODO" -c                            # 每個檔案只印命中行數
+ncfetch grep "TODO" -m 1 -w 16                    # 每檔命中 1 筆就中斷傳輸；16 條並行
+ncfetch grep "測試" "Docs" --encoding big5         # 非 UTF-8 檔案
+```
+
+輸出沿用 grep 慣例：命中行是 `路徑:行號:內容`，前後文是 `路徑-行號-內容`，命中字串在終端機中會上色（`--no-color` 或環境變數 `NO_COLOR` 可關閉）。**找不到任何命中時 exit code 為 `1`**，方便寫在腳本裡判斷。
+
+預設行為：
+- 略過二進位檔（前 8KB 含 NUL byte），要一起搜尋請加 `--binary`
+- 略過大於 `--max-size`（預設 `5M`）的檔案；`--max-size 0` 代表不限
+- 進度列與統計走 stderr、命中結果走 stdout，可安全接管線；`-q` 可全部關掉
+
+公開分享版本用法相同，只是前面多一個 token/URL：
+```bash
+ncfetch public-find "<token>" "<folder>" --name "*.pdf" -p "<share_password>"
+ncfetch public-grep "<token>" "TODO" "<folder>" -C 1
+```
+
+### 直接輸出檔案內容 (`cat`)
+
+把遠端檔案內容直接印到 stdout，方便接本機工具：
+```bash
+ncfetch cat "Projects/config.json" | jq .
+ncfetch cat "logs/app.log" | grep -c ERROR
+ncfetch public-cat "<token>" "notes.md" -p "<share_password>"
 ```
 
 ### 上傳
@@ -163,7 +221,7 @@ ncfetch upload-folder ./dataset "Datasets/raw" --no-overwrite
 ### 升級
 
 ```bash
-uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.2.1"
+uv pip install --upgrade "git+https://github.com/JohnsonWang1015/NextcloudFetcher.git@v0.3.0"
 ```
 
-或把上面 `@v0.2.1` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。
+或把上面 `@v0.3.0` 換成最新 tag。可用版本見 [Releases / tags](https://github.com/JohnsonWang1015/NextcloudFetcher/tags)。

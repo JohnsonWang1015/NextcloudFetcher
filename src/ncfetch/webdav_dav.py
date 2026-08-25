@@ -1,6 +1,8 @@
 from __future__ import annotations
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import List, Optional
 from urllib.parse import unquote, urlsplit
 
@@ -19,6 +21,22 @@ class DAVEntry:
     rel_path: str
     is_dir: bool
     size: Optional[int] = None
+    mtime: Optional[datetime] = None
+
+
+def parse_http_date(value: str | None) -> Optional[datetime]:
+    """Parse a DAV getlastmodified (RFC 1123) value; None on anything unparseable.
+
+    Always returns a tz-aware datetime — a date without a zone is read as UTC —
+    so callers can compare mtimes without hitting naive/aware TypeErrors.
+    """
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 async def propfind(client: httpx.AsyncClient, url: str, depth: int = 1) -> httpx.Response:
@@ -61,5 +79,8 @@ def parse_propfind(base_url: str, content: bytes) -> List[DAVEntry]:
         if cl_el is not None and cl_el.text and cl_el.text.isdigit():
             size = int(cl_el.text)
 
-        entries.append(DAVEntry(rel_path=rel, is_dir=is_dir, size=size))
+        mt_el = resp.find(".//d:getlastmodified", NS)
+        mtime = parse_http_date(mt_el.text if mt_el is not None else None)
+
+        entries.append(DAVEntry(rel_path=rel, is_dir=is_dir, size=size, mtime=mtime))
     return entries

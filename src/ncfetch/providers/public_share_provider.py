@@ -2,12 +2,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Callable, List, Optional, Tuple
 import httpx
 from urllib.parse import quote
 
 from ..config import Settings
 from ..provider_base import StorageProvider
+from ..search import (
+    FindSpec,
+    GrepMatch,
+    GrepSpec,
+    GrepStats,
+    RemoteFile,
+    find_entries,
+    grep_tree,
+    walk_propfind,
+)
 from ..webdav_dav import DAVEntry, propfind, parse_propfind
 from .webdav_provider import (
     _is_zip_response,
@@ -116,6 +126,45 @@ class PublicShareProvider(StorageProvider):
                 remote_folder=remote_folder,
                 local_dir=local_dir,
                 workers=workers,
+            )
+
+    # ---------- 搜尋：檔名 (find) 與內容 (grep) ----------
+
+    async def stream_file(self, remote_path: str) -> AsyncIterator[bytes]:
+        """Yield a shared file's bytes without touching disk (backs `ncfetch public-cat`)."""
+        url = self._build_webdav_url(remote_path)
+        async with self._client() as client:
+            async for chunk in self._stream(client, url):
+                yield chunk
+
+    async def walk(self, remote_folder: str = "") -> Tuple[List[RemoteFile], List[RemoteFile]]:
+        async with self._client() as client:
+            return await walk_propfind(
+                client=client, url_builder=self._build_webdav_url,
+                base_dir=remote_folder.strip("/"),
+            )
+
+    async def find(self, remote_folder: str, spec: FindSpec) -> List[RemoteFile]:
+        async with self._client() as client:
+            return await find_entries(
+                client=client, url_builder=self._build_webdav_url,
+                remote_folder=remote_folder, spec=spec,
+            )
+
+    async def grep(
+        self,
+        remote_folder: str,
+        spec: GrepSpec,
+        *,
+        workers: int = 8,
+        on_file_result: Optional[Callable[[str, List[GrepMatch]], None]] = None,
+        progress: bool = True,
+    ) -> GrepStats:
+        async with self._client(follow_redirects=True) as client:
+            return await grep_tree(
+                client=client, url_builder=self._build_webdav_url,
+                remote_folder=remote_folder, spec=spec, workers=workers,
+                on_file_result=on_file_result, progress=progress,
             )
 
     # ---------- 資料夾 (帶三段式 fallback) ----------
