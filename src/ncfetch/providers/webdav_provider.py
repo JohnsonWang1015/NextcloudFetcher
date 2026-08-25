@@ -3,7 +3,7 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from typing import AsyncIterator, Callable, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -235,12 +235,50 @@ class WebDAVProvider(StorageProvider):
         resp.raise_for_status()
 
     async def ensure_remote_dir(self, client: httpx.AsyncClient, remote_dir: str) -> None:
-        """逐層 MKCOL 建立資料夾 (idempotent)。空字串視為根，直接略過。"""
-        parts = [p for p in remote_dir.strip("/").split("/") if p]
-        cur = ""
-        for p in parts:
-            cur = f"{cur}/{p}" if cur else p
-            await self._mkcol_one(client, cur)
+        """逐層 MKCOL 建立單一資料夾 (idempotent)。空字串視為根，直接略過。"""
+        await self.ensure_remote_dirs(client, [remote_dir], concurrency=1)
+
+    async def ensure_remote_dirs(
+        self,
+        client: httpx.AsyncClient,
+        dirs: Iterable[str],
+        *,
+        concurrency: int = 4,
+    ) -> None:
+        """MKCOL a whole set of directories at once — deduped, shallowest depth first.
+
+        Every path implies its ancestors, and callers hand us overlapping trees
+        (`a/b/c` and `a/b/d` share `a` and `a/b`), so expanding them into one set
+        collapses what used to be one MKCOL per level *per directory* into one
+        MKCOL per distinct directory. On a wide tree that is the difference
+        between O(dirs x depth) round-trips and O(dirs).
+
+        Depth levels stay serialized because MKCOL requires the parent to exist,
+        but directories at the same depth are independent and go out in parallel.
+        """
+        needed: set[str] = set()
+        for d in dirs:
+            cur = ""
+            for part in (d or "").strip("/").split("/"):
+                if not part:
+                    continue
+                cur = f"{cur}/{part}" if cur else part
+                needed.add(cur)
+        if not needed:
+            return
+
+        by_depth: dict[int, List[str]] = {}
+        for d in needed:
+            by_depth.setdefault(d.count("/"), []).append(d)
+
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def one(remote_dir: str) -> None:
+            async with sem:
+                await self._mkcol_one(client, remote_dir)
+
+        for depth in sorted(by_depth):
+            await asyncio.gather(*(one(d) for d in sorted(by_depth[depth])))
 
     async def _put_file(
         self,
@@ -317,13 +355,13 @@ class WebDAVProvider(StorageProvider):
         )
         remote_root = remote_folder.strip("/")
 
+        targets = [remote_root] if remote_root else []
+        for d in subdirs:
+            rel = d.relative_to(local_folder).as_posix()
+            targets.append(f"{remote_root}/{rel}" if remote_root else rel)
+
         async with self._client() as client:
-            if remote_root:
-                await self.ensure_remote_dir(client, remote_root)
-            for d in subdirs:
-                rel = d.relative_to(local_folder).as_posix()
-                target_dir = f"{remote_root}/{rel}" if remote_root else rel
-                await self.ensure_remote_dir(client, target_dir)
+            await self.ensure_remote_dirs(client, targets, concurrency=concurrency)
 
             sem = asyncio.Semaphore(max(1, concurrency))
             outer = tqdm(
@@ -387,12 +425,7 @@ class WebDAVProvider(StorageProvider):
                 raise ValueError(f"不支援的來源類型：{src}")
 
         async with self._client() as client:
-            # 依深度建立目錄 (淺者優先)，去重避免重複呼叫
-            seen: set[str] = set()
-            for d in sorted(dirs_to_make, key=lambda s: len(s.split("/"))):
-                if d and d not in seen:
-                    await self.ensure_remote_dir(client, d)
-                    seen.add(d)
+            await self.ensure_remote_dirs(client, dirs_to_make, concurrency=concurrency)
 
             sem = asyncio.Semaphore(max(1, concurrency))
             outer = tqdm(

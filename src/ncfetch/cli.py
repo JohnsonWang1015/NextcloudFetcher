@@ -345,7 +345,7 @@ def upload_file_cmd(
 def upload_folder_cmd(
     local_folder: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True, help="本機資料夾路徑"),
     remote_folder: str = typer.Argument(..., help="遠端目標資料夾，例如 'Backups/2026'"),
-    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數 (預設 4)"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數／同時建立資料夾數 (預設 4)"),
     no_overwrite: bool = typer.Option(False, "--no-overwrite", help="若遠端檔案已存在則中止 (預設覆蓋)"),
 ):
     """遞迴上傳整個資料夾到 Nextcloud (本機資料夾的內容會放在 remote_folder 之下)。"""
@@ -366,7 +366,7 @@ def upload_folder_cmd(
 def upload_batch_cmd(
     sources: List[Path] = typer.Argument(..., exists=True, help="多個本機檔案或資料夾路徑 (可混合)"),
     to: str = typer.Option(..., "--to", "-t", help="遠端目標資料夾，所有來源放在此資料夾之下"),
-    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數 (預設 4)"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", min=1, max=32, help="同時上傳檔案數／同時建立資料夾數 (預設 4)"),
     no_overwrite: bool = typer.Option(False, "--no-overwrite", help="若遠端檔案已存在則中止 (預設覆蓋)"),
 ):
     """批次上傳多個檔案/資料夾到指定遠端資料夾。資料夾會保留結構放到 <to>/<資料夾名>/。"""
